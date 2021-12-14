@@ -1,10 +1,12 @@
 ###############################################################################
 # General Information
 ###############################################################################
-# author: dan dipietro | daniel.m.dipietro.22@dartmouth.edu
-# description:
-# - pytorch implementation of deep symbolic regression (petersen et al.)
-# - currently implemented for x^3 + x^2 + x test dataset
+# Author: Daniel DiPietro | dandipietro.com | https://github.com/dandip
+
+# Original Paper: https://arxiv.org/abs/1912.04871 (Petersen et al)
+
+# train.py: Contains main training loop (and reward functions) for PyTorch
+# implementation of Deep Symbolic Regression.
 
 ###############################################################################
 # Dependencies
@@ -18,7 +20,6 @@ import numpy as np
 from torch.autograd import Variable
 from operators import Operators
 from rnn import DSRRNN
-from training_utils import *
 from expression_utils import *
 from collections import Counter
 
@@ -26,16 +27,70 @@ from collections import Counter
 # Main Training loop
 ###############################################################################
 
-def main():
-    # Hyperparameters
-    lr = 0.0005 # Learning rate for sequence-generating RNN
-    inner_lr = 0.005 # Learning rate for training of constants within expressions
-    entropy_coefficient = 0.005
-    risk_factor = 0.60 # We discard the bottom risk_factor quantile of expressions when training the RNN
-    batch_size = 500
-    num_batches = 200
-    hidden_size = 500
-    use_gpu = False # (Leave set to False for now)
+def train(
+        X_constants,
+        y_constants,
+        X_rnn,
+        y_rnn,
+        operator_list = ['*', '+', '-', '/', '^', 'cos', 'sin', 'c', 'var_x'],
+        min_length = 2,
+        max_length = 12,
+        type = 'lstm',
+        num_layers = 1,
+        dropout = 0.0,
+        lr = 0.0005,
+        optimizer = 'adam',
+        inner_optimizer = 'rmsprop',
+        inner_lr = 0.1,
+        inner_num_epochs = 15,
+        entropy_coefficient = 0.005,
+        risk_factor = 0.95,
+        initial_batch_size = 2000,
+        scale_initial_risk = True,
+        batch_size = 500,
+        num_batches = 200,
+        hidden_size = 500,
+        use_gpu = False,
+        live_print = True,
+        summary_print = True
+    ):
+    """Deep Symbolic Regression Training Loop
+
+    ~ Parameters ~
+    - X_constants (Tensor): X dataset used for training constants
+    - y_constants (Tensor): y dataset used for training constants
+    - X_rnn (Tensor): X dataset used for obtaining reward / training RNN
+    - y_rnn (Tensor): y dataset used for obtaining reward / training RNN
+    - operator_list (list of str): operators to use (all variables must have prefix var_)
+    - min_length (int): minimum number of operators to allow in expression
+    - max_length (int): maximum number of operators to allow in expression
+    - type ('rnn', 'lstm', or 'gru'): type of architecture to use
+    - num_layers (int): number of layers in RNN architecture
+    - dropout (float): dropout (if any) for RNN architecture
+    - lr (float): learning rate for RNN
+    - optimizer ('adam' or 'rmsprop'): optimizer for RNN
+    - inner_optimizer ('lbfgs', 'adam', or 'rmsprop'): optimizer for expressions
+    - inner_lr (float): learning rate for constant optimization
+    - inner_num_epochs (int): number of epochs for constant optimization
+    - entropy_coefficient (float): entropy coefficient for RNN
+    - risk_factor (float, >0, <1): we discard the bottom risk_factor quantile
+      when training the RNN
+    - batch_size (int): batch size for training the RNN
+    - num_batches (int): number of batches (will stop early if found)
+    - hidden_size (int): hidden dimension size for RNN
+    - use_gpu (bool): whether or not to train with GPU
+    - live_print (bool): if true, will print updates during training process
+
+    ~ Returns ~
+    A list of four lists:
+    [0] epoch_best_rewards (list of float): list of highest reward obtained each epoch
+    [1] epoch_best_expressions (list of Expression): list of best expression each epoch
+    [2] best_reward (float): best reward obtained
+    [3] best_expression (Expression): best expression obtained
+    """
+
+    epoch_best_rewards = []
+    epoch_best_expressions = []
 
     # Establish GPU device if necessary
     if (use_gpu and torch.cuda.is_available()):
@@ -43,177 +98,125 @@ def main():
     else:
         device = torch.device("cpu")
 
-    # Load training and test data
-    X_train, X_test, y_train, y_test = get_data()
-    X_train, X_test = X_train.to(device), X_test.to(device)
-    y_train, y_test = y_train.to(device), y_test.to(device)
-
-    # Initialize operators: all variable operators must have the prefix "var_"
-    operator_list = ['*', '+', '-', '/', '^', 'cos', 'sin', 'var_x']
+    # Initialize operators, RNN, and optimizer
     operators = Operators(operator_list, device)
-
-    # Initialize RNN and optimizer
-    dsr_rnn = DSRRNN(operators, hidden_size).to(device)
-    optimizer = torch.optim.RMSprop(dsr_rnn.parameters(), lr=lr)
+    dsr_rnn = DSRRNN(operators, hidden_size, device, min_length=min_length,
+                     max_length=max_length, type=type, dropout=dropout
+                     ).to(device)
+    if (optimizer == 'adam'):
+        optim = torch.optim.Adam(dsr_rnn.parameters(), lr=lr)
+    else:
+        optim = torch.optim.RMSprop(dsr_rnn.parameters(), lr=lr)
 
     # Best expression and its performance
     best_expression, best_performance = None, float('-inf')
 
-    # Number of times we've seen each equation
-    equation_count = Counter()
-
-    # Outer loop: trains RNN after batches of expressions are generated and benchmarked
+    # First sampling done outside of loop for initial batch size if desired
+    start = time.time()
+    sequences, sequence_lengths, log_probabilities, entropies = dsr_rnn.sample_sequence(initial_batch_size)
     for i in range(num_batches):
-        # Inner loop: generates expressions from the RNN and benchmarks them
-        sequences = []
-        expressions = []
-        rewards = []
-        log_probabilities = []
-        entropies = []
-        for j in range(batch_size):
-            # Sample sequences and obtain the log probability of generating a given sequence
-            seq, log_prob, entropy = sample_sequence(dsr_rnn, operators, device)
-            sequences.append(seq)
-            log_probabilities.append(log_prob)
-            entropies.append(entropy)
-
-        # Update equation counter
-        equation_count.update([tuple(x) for x in sequences])
-
         # Convert sequences into Pytorch expressions that can be evaluated
-        for sequence in sequences:
-            expressions.append(Expression(operators, sequence).to(device))
+        expressions = []
+        for j in range(len(sequences)):
+            expressions.append(
+                Expression(operators, sequences[j].long().tolist(), sequence_lengths[j].long().tolist()).to(device)
+            )
 
         # Optimize constants of expressions (training data)
-        for expression in expressions:
-            optimize_constants(expression, X_train, y_train, inner_lr)
+        optimize_constants(expressions, X_constants, y_constants, inner_lr, inner_num_epochs, inner_optimizer)
 
         # Benchmark expressions (test dataset)
+        rewards = []
         for expression in expressions:
-            rewards.append(benchmark(expression, X_test, y_test))
+            rewards.append(benchmark(expression, X_rnn, y_rnn))
+        rewards = torch.tensor(rewards)
 
         # Update best expression
+        best_epoch_expression = expressions[np.argmax(rewards)]
+        epoch_best_expressions.append(best_epoch_expression)
+        epoch_best_rewards.append(max(rewards).item())
         if (max(rewards) > best_performance):
             best_performance = max(rewards)
-            best_expression = expressions[np.argmax(rewards)]
+            best_expression = best_epoch_expression
 
         # Early stopping criteria
         if (best_performance >= 0.98):
-            print("~ Early Stopping Met ~")
-            print(f"""Best Expression: {best_expression}""")
+            best_str = str(best_expression)
+            if (live_print):
+                print("~ Early Stopping Met ~")
+                print(f"""Best Expression: {best_str}""")
             break
 
         # Compute risk threshold
-        threshold = np.quantile(rewards, risk_factor)
-        indices_to_keep = [i for i in range(len(rewards)) if rewards[i] > threshold]
+        if (i == 0 and scale_initial_risk):
+            threshold = np.quantile(rewards, 1 - (1 - risk_factor) / (initial_batch_size / batch_size))
+        else:
+            threshold = np.quantile(rewards, risk_factor)
+        indices_to_keep = torch.tensor([j for j in range(len(rewards)) if rewards[j] > threshold])
 
-        # Select corresponding subset of sequences
-        sequences = np.array(sequences, dtype='object')[indices_to_keep]
-        expressions = np.array(expressions)[indices_to_keep]
-        rewards = np.array(rewards)[indices_to_keep]
-        log_probabilities = [log_probabilities[j] for j in range(len(log_probabilities)) if j in indices_to_keep]
-        entropies = [entropies[j] for j in range(len(entropies)) if j in indices_to_keep]
+        if (len(indices_to_keep) == 0 and summary_print):
+            print("Threshold removes all expressions. Terminating.")
+            break
 
-        # Iterate over subset of sequences above threshold to train RNN
-        risk_seeking_grad = 0
-        entropy_grad = 0
-        for j in range(len(sequences)):
-            # Increment risk seeking policy gradient
-            risk_seeking_grad += (rewards[j] - threshold) * log_probabilities[j]
-            # Increment entropy gradient
-            entropy_grad += entropies[j]
+        # Select corresponding subset of rewards, log_probabilities, and entropies
+        rewards = torch.index_select(rewards, 0, indices_to_keep)
+        log_probabilities = torch.index_select(log_probabilities, 0, indices_to_keep)
+        entropies = torch.index_select(entropies, 0, indices_to_keep)
+
+        # Compute risk seeking and entropy gradient
+        risk_seeking_grad = torch.sum((rewards - threshold) * log_probabilities, axis=0)
+        entropy_grad = torch.sum(entropies, axis=0)
 
         # Mean reduction and clip to limit exploding gradients
-        risk_seeking_grad = torch.clip(risk_seeking_grad / len(sequences), -1e6, 1e6)
-        entropy_grad = entropy_coefficient * torch.clip(entropy_grad / len(sequences), -1e6, 1e6)
+        risk_seeking_grad = torch.clip(risk_seeking_grad / len(rewards), -1e6, 1e6)
+        entropy_grad = entropy_coefficient * torch.clip(entropy_grad / len(rewards), -1e6, 1e6)
 
         # Compute loss and backpropagate
-        loss = lr * (risk_seeking_grad + entropy_grad)
+        loss = -1 * lr * (risk_seeking_grad + entropy_grad)
         loss.backward()
-        optimizer.step()
+        optim.step()
 
         # Epoch Summary
-        print(f"""Epoch: {i} ({int(time.time())})
-        Entropy Loss: {entropy_grad.item()}
-        Risk-Seeking Loss: {risk_seeking_grad.item()}
-        Total Loss: {loss.item()}
-        Best Performance (Overall): {best_performance}
-        Best Performance (Epoch): {max(rewards)}
-        Best Expression (Overall): {best_expression}
-        Best Expression (Epoch): {expressions[np.argmax(rewards)]}
+        if (live_print):
+            print(f"""Epoch: {i+1} ({round(float(time.time() - start), 2)}s elapsed)
+            Entropy Loss: {entropy_grad.item()}
+            Risk-Seeking Loss: {risk_seeking_grad.item()}
+            Total Loss: {loss.item()}
+            Best Performance (Overall): {best_performance}
+            Best Performance (Epoch): {max(rewards)}
+            Best Expression (Overall): {best_expression}
+            Best Expression (Epoch): {best_epoch_expression}
+            """)
+        # Sample for next batch
+        sequences, sequence_lengths, log_probabilities, entropies = dsr_rnn.sample_sequence(batch_size)
+
+    if (summary_print):
+        print(f"""
+        Time Elapsed: {round(float(time.time() - start), 2)}s
+        Epochs Required: {i+1}
+        Best Performance: {round(best_performance.item(),3)}
+        Best Expression: {best_expression}
         """)
 
-###############################################################################
-# Getting Data
-###############################################################################
-
-def get_data():
-    """Constructs data for model (currently x^3 + x^2 + x)
-    """
-    X = np.arange(-2, 2.1, 0.1)
-    y = X**3 + X**2 + X
-    X = X.reshape(X.shape[0], 1)
-
-    # Split randomly
-    comb = list(zip(X, y))
-    random.shuffle(comb)
-    X, y = zip(*comb)
-
-    # Proportion used to train constants versus benchmarking functions
-    training_proportion = 0.2
-    div = int(training_proportion*len(X))
-    X_train, X_test = np.array(X[:div]), np.array(X[div:])
-    y_train, y_test = np.array(y[:div]), np.array(y[div:])
-    X_train, X_test = torch.Tensor(X_train), torch.Tensor(X_test)
-    y_train, y_test = torch.Tensor(y_train), torch.Tensor(y_test)
-    return X_train, X_test, y_train, y_test
-
-###############################################################################
-# Optimizing constants
-###############################################################################
-
-def optimize_constants(expression, X_train, y_train, inner_lr, epochs=500):
-    """Optimizes constants of passed expression
-    """
-    if (expression.num_constants == 0):
-        return False
-    optim = torch.optim.RMSprop(expression.parameters(), lr=inner_lr)
-    loss = torch.nn.L1Loss()
-    for i in range(epochs):
-        optim.zero_grad()
-        y = expression(Variable(X_train, requires_grad=True))
-        loss(y, y_train).backward()
-        optim.step()
+    return [epoch_best_rewards, epoch_best_expressions, best_performance, best_expression]
 
 ###############################################################################
 # Reward function
 ###############################################################################
 
-def benchmark(expression, X_test, y_test):
-    """Obtain reward for a given expression using the passed X_test and y_test
+def benchmark(expression, X_rnn, y_rnn):
+    """Obtain reward for a given expression using the passed X_rnn and y_rnn
     """
     with torch.no_grad():
-        y_pred = expression(X_test)
-        return reward_nrmse(y_pred, y_test)
+        y_pred = expression(X_rnn)
+        return reward_nrmse(y_pred, y_rnn)
 
-def reward_l1(y_pred, y_test):
-    """Compute L1 between predicted y and actual y
-    """
-    loss = nn.L1Loss()
-    val = loss(y_pred, y_test)
-    val = min(torch.nan_to_num(val, nan=1e10), torch.tensor(1e10)) # Fix nan and clip
-    val = 1 / (1 + val) # Squash
-    return val.item()
-
-def reward_nrmse(y_pred, y_test):
+def reward_nrmse(y_pred, y_rnn):
     """Compute NRMSE between predicted y and actual y
     """
     loss = nn.MSELoss()
-    val = torch.sqrt(loss(y_pred, y_test)) # Convert to RMSE
-    val = torch.std(y_test) * val # Normalize using stdev of targets
+    val = torch.sqrt(loss(y_pred, y_rnn)) # Convert to RMSE
+    val = torch.std(y_rnn) * val # Normalize using stdev of targets
     val = min(torch.nan_to_num(val, nan=1e10), torch.tensor(1e10)) # Fix nan and clip
     val = 1 / (1 + val) # Squash
     return val.item()
-
-if __name__=='__main__':
-    main()
